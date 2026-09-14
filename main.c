@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <sys/event.h>
 #include <os/lock.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -43,6 +42,25 @@
 // measurable difference. --sockbuf-size=N overrides; --sockbuf-size=0
 // leaves the OS default untouched.
 #define DEFAULT_SOCKBUF_SIZE (1024 * 1024)
+
+// Maximum length of a single frame, matching what the wire protocol's
+// 4-byte length prefix is expected to carry in practice.
+#define MAX_FRAME_SIZE 65536
+
+// Each read() call in on_accept() is capped to this many new bytes,
+// regardless of how much buffer space remains -- ingestion must stay
+// bounded relative to the WRITE_BATCH_MAX-frame drain per cycle, or
+// leftover can grow without bound (an earlier version of this let a read()
+// request scale with whatever buffer space happened to remain, which could
+// shrink the request to 0 bytes under sustained load; a 0-byte read()
+// request returns 0 immediately, which is indistinguishable from EOF and
+// tore the connection down). A bounded chunk size also caps how much
+// latency one gathering cycle can add before a batch gets dispatched at
+// all, instead of accumulating an unbounded amount before doing anything.
+#define READ_CHUNK_SIZE MAX_FRAME_SIZE
+// Scratch buffer: room for one full chunk of new data plus up to one
+// max-size frame's worth of leftover from the previous cycle.
+#define READ_BUF_SIZE (READ_CHUNK_SIZE + MAX_FRAME_SIZE)
 
 bool debug = false;
 
@@ -649,17 +667,20 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     }
   }
 
-  // WRITE_BATCH_MAX buffers, each sized for one max-size packet, allocated
-  // once for the life of this connection rather than per packet. Batching
-  // amortizes vmnet_write()'s XPC round-trip cost (and, symmetrically, the
-  // flood writev() below) across multiple packets instead of paying it once
-  // per packet -- measured at roughly 2x throughput for client<->client
-  // traffic on the same daemon.
-  size_t buf_len = 64 * 1024;
-  void *bufs[WRITE_BATCH_MAX] = {0};
-  for (int i = 0; i < WRITE_BATCH_MAX; i++) {
-    int rc = posix_memalign(&bufs[i], CACHE_LINE_SIZE, buf_len);
-    if (rc != 0 || bufs[i] == NULL) {
+  // Single contiguous scratch buffer that one read() call fills, then
+  // parsed into as many complete length-prefixed frames as are present.
+  // Batching amortizes vmnet_write()'s XPC round-trip cost (and,
+  // symmetrically, the flood writev() below) across multiple packets
+  // instead of paying it once per packet -- measured at roughly 2x
+  // throughput for client<->client traffic on the same daemon. Reading in
+  // one bounded bulk read() instead of two syscalls (header, then body)
+  // per packet took that further again, to roughly another 1.5-1.6x on top
+  // of that.
+  void *scratch = NULL;
+  size_t leftover = 0;
+  {
+    int rc = posix_memalign(&scratch, CACHE_LINE_SIZE, READ_BUF_SIZE);
+    if (rc != 0 || scratch == NULL) {
       ERRORF("posix_memalign: %s", strerror(rc));
       goto done;
     }
@@ -671,62 +692,64 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
 
   for (uint64_t i = 0;; i++) {
     DEBUGF("[Socket-to-VMNET i=%lld] Receiving from the socket %d", i, accept_fd);
-    uint32_t header_be = 0;
-    ssize_t header_received = read(accept_fd, &header_be, 4);
-    if (header_received < 0) {
-      ERRORN("read[header]");
-      goto done;
-    }
-    if (header_received == 0) {
-      // EOF according to man page of read.
-      INFOF("Connection closed by peer (fd %d)", accept_fd);
-      goto done;
-    }
-    uint32_t header = ntohl(header_be);
-    assert(header <= buf_len);
-    ssize_t received = read(accept_fd, bufs[0], header);
-    if (received < 0) {
-      ERRORN("read[body]");
-      goto done;
-    }
-    if (received == 0) {
-      // EOF according to man page of read.
-      INFOF("Connection closed by peer (fd %d)", accept_fd);
-      goto done;
-    }
-    assert(received == header);
-    DEBUGF("[Socket-to-VMNET i=%lld] Received from the socket %d: %ld bytes", i, accept_fd,
-           received);
 
-    int batch_count = 1;
-    batch_headers_be[0] = header_be;
-    batch_iov[0] = (struct iovec){.iov_base = bufs[0], .iov_len = header};
-    batch_pdv[0] = (struct vmpktdesc){
-        .vm_pkt_size = header, .vm_pkt_iov = &batch_iov[0], .vm_pkt_iovcnt = 1, .vm_flags = 0};
-
-    // Opportunistically pick up any more packets already sitting in the
-    // socket buffer -- never blocks waiting for more, so a lone packet
-    // still pays no extra latency for this.
-    int avail = 0;
-    while (batch_count < WRITE_BATCH_MAX && ioctl(accept_fd, FIONREAD, &avail) == 0 &&
-           avail >= 4) {
-      uint32_t next_header_be = 0;
-      ssize_t hr = read(accept_fd, &next_header_be, 4);
-      if (hr <= 0)
-        break;
-      uint32_t next_header = ntohl(next_header_be);
-      assert(next_header <= buf_len);
-      void *slot = bufs[batch_count];
-      ssize_t br = read(accept_fd, slot, next_header);
-      if (br <= 0)
-        break;
-      batch_headers_be[batch_count] = next_header_be;
-      batch_iov[batch_count] = (struct iovec){.iov_base = slot, .iov_len = (size_t)next_header};
-      batch_pdv[batch_count] = (struct vmpktdesc){.vm_pkt_size = next_header,
-                                                   .vm_pkt_iov = &batch_iov[batch_count],
-                                                   .vm_pkt_iovcnt = 1,
-                                                   .vm_flags = 0};
+    // Fill whatever's already buffered in one syscall, capped to
+    // READ_CHUNK_SIZE (not "whatever room happens to be left" -- see the
+    // comment on that constant), then parse as many complete
+    // length-prefixed frames out of it as are present below, carrying over
+    // any trailing partial frame to combine with the next read.
+    size_t room = READ_BUF_SIZE - leftover;
+    size_t want = room < READ_CHUNK_SIZE ? room : READ_CHUNK_SIZE;
+    ssize_t new_bytes = 0;
+    if (want > 0) {
+      new_bytes = read(accept_fd, (uint8_t *)scratch + leftover, want);
+      if (new_bytes < 0) {
+        ERRORN("read");
+        goto done;
+      }
+      if (new_bytes == 0) {
+        // EOF according to man page of read.
+        INFOF("Connection closed by peer (fd %d)", accept_fd);
+        goto done;
+      }
+    }
+    // want == 0 means the previous cycle's leftover already fills a full
+    // chunk's worth of buffer -- skip the read this time (a 0-byte read()
+    // request isn't meaningful and shouldn't be confused with EOF) and just
+    // parse what's already sitting there; that drains some of it and frees
+    // room for the next cycle's read.
+    size_t total = leftover + (size_t)new_bytes;
+    size_t cursor = 0;
+    int batch_count = 0;
+    while (batch_count < WRITE_BATCH_MAX && total - cursor >= 4) {
+      uint32_t hdr_be;
+      memcpy(&hdr_be, (uint8_t *)scratch + cursor, 4);
+      uint32_t hdr = ntohl(hdr_be);
+      assert(hdr <= MAX_FRAME_SIZE);
+      if (total - cursor - 4 < hdr) {
+        break; // incomplete frame -- wait for more data next read
+      }
+      void *frame_ptr = (uint8_t *)scratch + cursor + 4;
+      batch_headers_be[batch_count] = hdr_be;
+      batch_iov[batch_count] = (struct iovec){.iov_base = frame_ptr, .iov_len = hdr};
+      batch_pdv[batch_count] = (struct vmpktdesc){
+          .vm_pkt_size = hdr, .vm_pkt_iov = &batch_iov[batch_count], .vm_pkt_iovcnt = 1, .vm_flags = 0};
+      cursor += 4 + hdr;
       batch_count++;
+    }
+    if (batch_count == 0) {
+      // Not even one complete frame yet -- e.g. a single frame close to
+      // MAX_FRAME_SIZE spanning more than one chunk read, or just the
+      // start of a connection. Keep everything as leftover and read more
+      // before parsing again, rather than dispatching an empty batch.
+      leftover = total;
+      continue;
+    }
+    if (cursor < total) {
+      memmove(scratch, (uint8_t *)scratch + cursor, total - cursor);
+      leftover = total - cursor;
+    } else {
+      leftover = 0;
     }
 
     int written_count = batch_count;
@@ -768,7 +791,5 @@ done:
   INFOF("Closing a connection (fd %d)", accept_fd);
   state_remove_socket_fd(state, accept_fd);
   close(accept_fd);
-  for (int i = 0; i < WRITE_BATCH_MAX; i++) {
-    free(bufs[i]);
-  }
+  free(scratch);
 }
