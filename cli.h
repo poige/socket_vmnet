@@ -28,6 +28,11 @@ struct cli_options {
   bool vmnet_disable_dhcp;
   // -p, --pidfile; writes pidfile using permissions of socket_vmnet
   char *pidfile;
+  // --sockbuf-size=BYTES; SO_SNDBUF/SO_RCVBUF applied to every accepted
+  // client connection. -1 (default, unset) means "use the daemon's own
+  // built-in default"; 0 means "leave the OS default untouched"; a
+  // positive value is used as-is.
+  int sockbuf_size;
   // arg
   char *socket_path;
 };

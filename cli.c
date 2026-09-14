@@ -67,6 +67,11 @@ static void print_usage(const char *argv0) {
          "(requires macOS 26;\n");
   printf("                                    lets an external DHCP server own "
          "the subnet)\n");
+  printf("--sockbuf-size=BYTES                 SO_SNDBUF/SO_RCVBUF applied to "
+         "every accepted\n");
+  printf("                                    client connection (default: 1 MiB; "
+         "0 leaves\n");
+  printf("                                    the OS default untouched)\n");
   printf("-p, --pidfile=PIDFILE               save pid to PIDFILE\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
@@ -88,6 +93,7 @@ enum {
   CLI_OPT_VMNET_NAT66_PREFIX,
   CLI_OPT_VMNET_NETWORK_IDENTIFIER,
   CLI_OPT_VMNET_DISABLE_DHCP,
+  CLI_OPT_SOCKBUF_SIZE,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -96,6 +102,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
     ERRORN("calloc");
     exit(EXIT_FAILURE);
   }
+  res->sockbuf_size = -1; /* unset; distinguishes "use built-in default" from --sockbuf-size=0 */
 
   const struct option longopts[] = {
       {"socket-group",             required_argument, NULL, CLI_OPT_SOCKET_GROUP            },
@@ -108,6 +115,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"vmnet-nat66-prefix",       required_argument, NULL, CLI_OPT_VMNET_NAT66_PREFIX      },
       {"vmnet-network-identifier", required_argument, NULL, CLI_OPT_VMNET_NETWORK_IDENTIFIER},
       {"vmnet-disable-dhcp",       no_argument,       NULL, CLI_OPT_VMNET_DISABLE_DHCP      },
+      {"sockbuf-size",             required_argument, NULL, CLI_OPT_SOCKBUF_SIZE            },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -160,6 +168,13 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     case CLI_OPT_VMNET_DISABLE_DHCP:
       res->vmnet_disable_dhcp = true;
+      break;
+    case CLI_OPT_SOCKBUF_SIZE:
+      res->sockbuf_size = atoi(optarg);
+      if (res->sockbuf_size < 0) {
+        ERRORF("invalid value \"%s\" for --sockbuf-size (must be >= 0)", optarg);
+        goto error;
+      }
       break;
     case 'p':
       res->pidfile = strdup(optarg);
