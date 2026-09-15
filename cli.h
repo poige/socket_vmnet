@@ -52,6 +52,12 @@ struct cli_options {
 #ifdef SOCKET_VMNET_DIAG
   bool skip_vmnet_write;
 #endif
+  // --dgram-socket; optional second listener speaking raw SOCK_DGRAM framing
+  // (one packet per datagram, no length header) instead of the SOCK_STREAM
+  // framing used by socket_vmnet_client/QEMU. This is what
+  // VZFileHandleNetworkDeviceAttachment-based clients (vfkit, Tart, ...)
+  // dial. See https://github.com/lima-vm/socket_vmnet/issues/13
+  char *dgram_socket_path;
   // arg
   char *socket_path;
 };

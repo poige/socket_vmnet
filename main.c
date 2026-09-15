@@ -99,6 +99,12 @@
 _Static_assert(DELIVERY_SCRATCH_SIZE >= READ_BUF_SIZE,
                "one whole slot must always fit, or a large slot could never be delivered");
 
+// Sub-timers that break the dgram drain's occupancy down by section. Two
+// mach_continuous_time() calls per frame is measurable -- around 1.5% of the
+// thread they measure -- so they are a build-time opt-in (make DIAG=1) rather
+// than something every deployment pays for. The drain's total occupancy, which
+// is what tells you whether the single drain thread is the ceiling, is always
+// counted: that costs two calls per batch, not per frame.
 // --skip-vmnet-write is a diagnostic that deliberately breaks the daemon: with
 // it, no frame reaches vmnet.framework, so DHCP, host access and external
 // networking all stop working and only client-to-client traffic survives. It
@@ -108,6 +114,14 @@ _Static_assert(DELIVERY_SCRATCH_SIZE >= READ_BUF_SIZE,
 #define VMNET_WRITE_SUPPRESSED(state) atomic_load(&(state)->skip_vmnet_write)
 #else
 #define VMNET_WRITE_SUPPRESSED(state) (false)
+#endif
+
+#ifdef SOCKET_VMNET_DIAG
+#define DIAG_TICK_START(v) uint64_t v = mach_continuous_time()
+#define DIAG_TICK_ADD(acc, v) (acc) += mach_continuous_time() - (v)
+#else
+#define DIAG_TICK_START(v) ((void)0)
+#define DIAG_TICK_ADD(acc, v) ((void)0)
 #endif
 
 // How many published batches back a slow target may fall behind a given
@@ -133,8 +147,12 @@ _Static_assert(DELIVERY_SCRATCH_SIZE >= READ_BUF_SIZE,
 // at realistic connection counts).
 #define OUTBOX_RING_SLOTS 256
 
-// Maximum number of simultaneously active client connections. IDs are reused
-// after disconnect and index the per-target cursor arrays below.
+// Lifetime cap on distinct conns (stream accepts + dgram peers) this process
+// will ever register, matching the existing "conns list, and now also
+// per-target read cursors, are never freed/reused" simplicity already
+// accepted elsewhere in this file -- fine for realistic Lima-scale usage;
+// would need revisiting for a daemon meant to run indefinitely under heavy
+// connection churn.
 #define MAX_CONNS 256
 
 bool debug = false;
@@ -164,6 +182,8 @@ struct outbox {
   // Serializes publisher-vs-publisher only. Readers (every other conn's
   // delivery thread) do NOT take this -- they use the seqlock protocol in
   // deliver_from_outbox() instead, so a reader can never block a publisher.
+  // Still needed because a dgram peer's outbox can genuinely have more than
+  // one publisher: on_dgram_readable() runs on the concurrent vms_queue.
   os_unfair_lock lock;
   // Published with release ordering after the slot's data and byte_len are
   // in place; read with acquire ordering by the seqlock reader. Next publish
@@ -282,14 +302,33 @@ static void print_vmnet_start_param(xpc_object_t param) {
 
 struct conn {
   // TODO: uint8_t mac[6];
+  bool is_dgram;
+  // For a stream conn: the accepted, per-client socket fd.
+  // For a dgram conn: the single shared listening dgram socket fd (same value
+  // for every dgram conn; the peer is disambiguated by dgram_peer below).
   int socket_fd;
+  struct sockaddr_un dgram_peer; // only meaningful when is_dgram
+  socklen_t dgram_peer_len;      // only meaningful when is_dgram
+  // Egress socket for a dgram conn: a private socket connect()ed to this peer,
+  // so delivery can send() instead of sendto(). Darwin resolves the pathname
+  // on every sendto(), which measured at 478 kpps against 1951 kpps for a
+  // connected send() -- a 4x ceiling on egress, and the daemon was running at
+  // ~85% of it. -1 when unset (every stream conn, and a dgram peer whose
+  // socket could not be set up, which falls back to sendto()).
+  int dgram_tx_fd;
+  // Set once when this peer's socket turns out to be gone. Pathname dgram
+  // peers (--dgram-socket) have no lease and no EOF, so a client that exits
+  // leaves its conn behind forever; without this, every broadcast keeps
+  // sending into a dead socket and logging the failure per frame.
+  _Atomic(bool) peer_gone;
   struct conn *next;
 
   struct state *state; // back-pointer, needed by this conn's own delivery thread
   int id;               // stable, assigned at creation; indexes other conns'
                          // target_read_seq[] when THEY read from THIS conn
   uint64_t generation;  // distinguishes different conns that reuse one id
-  struct outbox outbox; // this conn as a SOURCE (published by its read/batch loop)
+  struct outbox outbox; // this conn as a SOURCE (published to by its own
+                         // read/batch loop, or by on_dgram_readable())
 
   // This conn as a TARGET: one dedicated thread pulls from every other
   // conn's outbox (plus the synthetic vmnet_outbox) and writes to this
@@ -324,6 +363,14 @@ struct conn {
   // Ingress side (written by this conn's own read loop).
   _Atomic(uint64_t) stat_slots_published;
   _Atomic(uint64_t) stat_bytes_published;
+  // Egress drops on a dgram target, counted separately because they are
+  // invisible to everything else: a dropped datagram leaves no trace in the
+  // ring's own drop counter, and TCP retransmits of zero say nothing about
+  // them either -- the guests may simply not have retransmitted yet.
+  _Atomic(uint64_t) stat_egress_eagain;
+  _Atomic(uint64_t) stat_egress_enobufs;
+  _Atomic(uint64_t) stat_egress_errors;
+  _Atomic(uint64_t) stat_egress_short;
 } _conn;
 _Static_assert(offsetof(struct conn, outbox) % 64 == 0,
                "embedded outbox should land 64-aligned within struct conn too");
@@ -332,6 +379,30 @@ struct state {
   os_unfair_lock sem;
   dispatch_queue_t vms_queue;
   dispatch_queue_t host_queue;
+  // Serial, and that is the point: the dgram socket is shared by every
+  // VZ-attached client, so draining it from the concurrent vms_queue let two
+  // frames from the *same* VM be recvfrom()'d by two threads and published in
+  // whichever order they raced to -- reordering a TCP stream inside the
+  // daemon. One queue, one drainer, arrival order preserved.
+  dispatch_queue_t dgram_queue;
+  // Drain buffer for that queue, owned by it alone, so the read path costs no
+  // allocation per frame (it used to malloc(64K)/free() each one).
+  uint8_t *dgram_scratch;
+  // How busy the single serial drain actually is. The whole ingress path for
+  // every VM runs on one thread, so if this approaches 100% of wall time it is
+  // the ceiling regardless of how idle the machine looks. Written only by that
+  // thread, read at dump time.
+  _Atomic(uint64_t) stat_dgram_busy_ticks;
+  _Atomic(uint64_t) stat_dgram_frames;
+  _Atomic(uint64_t) stat_dgram_runs; // same-peer runs; frames/runs = batch size
+  // Where the saturated drain thread's time actually goes. Sub-timers rather
+  // than a profiler because sample(1) needs root against this process. Each is
+  // two mach_continuous_time() calls, ~20 ns, so at ~440 kpps the recvfrom
+  // timer costs well under 2% of the thread it measures.
+  _Atomic(uint64_t) stat_dgram_recv_ticks;
+  _Atomic(uint64_t) stat_dgram_vmnet_ticks;
+  uint64_t stat_last_dump_ticks;      // dump-time only, single reader
+  double stat_dgram_busy_us_at_dump;  // dump-time only, single reader
   struct conn *conns; // TODO: avoid O(N) lookup
 
   // SO_SNDBUF/SO_RCVBUF applied to every accepted client connection; from
@@ -430,6 +501,10 @@ static void conn_retain(struct conn *conn) {
 
 static void conn_release(struct conn *conn) {
   if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
+    if (conn->dgram_tx_fd >= 0) {
+      close(conn->dgram_tx_fd);
+      conn->dgram_tx_fd = -1;
+    }
     free_pages(conn->delivery_scratch, DELIVERY_SCRATCH_SIZE);
     free_pages(conn, sizeof(*conn));
   }
@@ -518,12 +593,106 @@ static struct conn *state_add_socket_fd(struct state *state, int socket_fd) {
     ERRORN("mmap(conn)");
     return NULL;
   }
+  conn->is_dgram = false;
   conn->socket_fd = socket_fd;
+  conn->dgram_tx_fd = -1;
   if (!state_add_conn(state, conn)) {
     free_pages(conn, sizeof(*conn));
     return NULL;
   }
   return conn;
+}
+
+// Opens this peer's egress socket: a private datagram socket connect()ed to
+// the peer so delivery can send() rather than sendto(). Verified on this
+// Darwin version: a client's connected socket accepts datagrams from a socket
+// other than the one it connected to, so replying from here rather than from
+// the shared listening socket is transparent to the client.
+//
+// Returns -1 on any failure, which is not fatal -- conn_send_dgram() then
+// falls back to sendto() on the shared socket, i.e. the previous behaviour.
+static int open_dgram_tx(struct state *state, const struct sockaddr_un *peer, socklen_t peer_len) {
+  int fd = socket(PF_LOCAL, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    ERRORN("socket(dgram tx)");
+    return -1;
+  }
+  if (connect(fd, (const struct sockaddr *)peer, peer_len) < 0) {
+    ERRORN("connect(dgram tx)");
+    close(fd);
+    return -1;
+  }
+  // Non-blocking is not an optimization here, it is the architecture. A
+  // *connected* AF_UNIX datagram send() blocks when the peer's receive buffer
+  // is full, where the unconnected sendto() this replaced returned ENOBUFS and
+  // dropped the frame. Blocking makes one slow target stall its delivery
+  // thread, which is exactly the head-of-line coupling the sliding queue
+  // exists to prevent -- and it deadlocked the daemon outright under
+  // bidirectional load: both VZ receive buffers filled, both delivery threads
+  // parked in send(), and the guests' virtio TX queues timed out.
+  //
+  // Congestion is signalled by the ring instead: a target that cannot keep up
+  // falls outside the retention window and loses whole batches at a clean
+  // boundary, which is what a switch does with a congested port.
+  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+    ERRORN("fcntl(O_NONBLOCK on dgram tx)");
+    close(fd);
+    return -1;
+  }
+  if (state->sockbuf_size > 0 &&
+      setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &state->sockbuf_size, sizeof(state->sockbuf_size)) < 0) {
+    ERRORN("setsockopt(SO_SNDBUF on dgram tx)"); // not fatal
+  }
+  return fd;
+}
+
+// Returns the existing dgram conn matching (dgram_fd, peer), or creates and
+// registers a new one. Unlike stream conns there is no notion of a dgram
+// "connection" closing, so entries just accumulate for the life of the
+// daemon; fine for the handful of long-lived local VM peers this is for.
+static struct conn *state_find_or_add_dgram_conn(struct state *state, int dgram_fd,
+                                                  const struct sockaddr_un *peer,
+                                                  socklen_t peer_len) {
+  os_unfair_lock_lock(&state->sem);
+  for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
+    if (conn->is_dgram && !atomic_load_explicit(&conn->peer_gone, memory_order_acquire) &&
+        conn->dgram_peer_len == peer_len &&
+        memcmp(&conn->dgram_peer, peer, peer_len) == 0) {
+      os_unfair_lock_unlock(&state->sem);
+      return conn;
+    }
+  }
+  os_unfair_lock_unlock(&state->sem);
+
+  struct conn *conn = alloc_pages_zeroed(sizeof(*conn));
+  if (conn == NULL) {
+    ERRORN("mmap(dgram conn)");
+    return NULL;
+  }
+  conn->is_dgram = true;
+  conn->socket_fd = dgram_fd;
+  conn->dgram_peer = *peer;
+  conn->dgram_peer_len = peer_len;
+  conn->dgram_tx_fd = open_dgram_tx(state, peer, peer_len);
+  if (!state_add_conn(state, conn)) {
+    // conn never reaches conn_release(), so its egress socket is closed here.
+    if (conn->dgram_tx_fd >= 0) {
+      close(conn->dgram_tx_fd);
+    }
+    free_pages(conn, sizeof(*conn));
+    return NULL;
+  }
+  INFOF("Registered new dgram peer \"%s\"", peer->sun_path);
+  return conn;
+}
+
+// Sends one raw ethernet frame (no length header) to a dgram conn's peer.
+static ssize_t conn_send_dgram(struct conn *conn, const void *frame, size_t frame_len) {
+  if (conn->dgram_tx_fd >= 0) {
+    return send(conn->dgram_tx_fd, frame, frame_len, 0);
+  }
+  return sendto(conn->socket_fd, frame, frame_len, 0, (struct sockaddr *)&conn->dgram_peer,
+                conn->dgram_peer_len);
 }
 
 // Wakes every *parked* delivery thread -- see the publish_mutex/publish_cond
@@ -545,8 +714,10 @@ static void signal_publish(struct state *state) {
 // format stream delivery already needs -- and publishes it (bumps
 // write_seq). This is the *only* thing that ever writes to an outbox; it's
 // a local copy under a lock held only for the copy itself, never touching a
-// socket, so publishing can never block on any peer. Every batch passed here
-// // is already bounded to fit in one slot by its caller's own read/parse
+// socket, so publishing can never block on any peer. Every batch this is
+// called with (whether on_accept()'s WRITE_BATCH_MAX-frame batches, or the
+// single-frame "batches" the vmnet-handler and dgram-readable paths publish)
+// is already bounded to fit in one slot by its caller's own read/parse
 // bounds -- see READ_BUF_SIZE and its callers -- the overflow guard below is
 // defensive, not expected to ever trigger.
 static void outbox_publish(struct state *state, struct outbox *outbox, uint32_t *headers_be,
@@ -716,6 +887,64 @@ static bool deliver_from_outbox(struct conn *self, struct outbox *src_outbox, ui
     }
 
     // ---- phase 2: write, from private memory ----
+    if (self->is_dgram) {
+      // Dgram is message-oriented (one sendto() == one whole frame, no
+      // length header), so the serialized batch has to be split back into
+      // individual frames here.
+      size_t off = 0;
+      while (off + 4 <= copied) {
+        uint32_t hdr_be;
+        memcpy(&hdr_be, self->delivery_scratch + off, 4);
+        uint32_t len = ntohl(hdr_be);
+        if (off + 4 + len > copied) {
+          break; // truncated trailer -- don't read past what we snapshotted
+        }
+        ssize_t written;
+        do {
+          written = conn_send_dgram(self, self->delivery_scratch + off + 4, len);
+        } while (written < 0 && errno == EINTR); // a signal is not congestion
+        if (written < 0) {
+          // Drop this datagram and move on -- never retry until it succeeds.
+          // Retrying would reintroduce exactly the coupling the non-blocking
+          // socket removed: one full target stalling its delivery thread and
+          // with it every source feeding that thread. The cursor has already
+          // advanced, so the frame is simply gone, which is what a congested
+          // switch port does.
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            atomic_fetch_add_explicit(&self->stat_egress_eagain, 1, memory_order_relaxed);
+          } else if (errno == ENOBUFS) {
+            // How a full receiver reports itself on a non-blocking unix
+            // datagram socket, not a fault. Counted, never logged per frame:
+            // that would turn a congested peer into a log flood.
+            atomic_fetch_add_explicit(&self->stat_egress_enobufs, 1, memory_order_relaxed);
+          } else {
+            // Everything else means this peer is gone, not congested. Listing
+            // the codes was the wrong shape and got it wrong: EDESTADDRREQ was
+            // handled, then Darwin returned ENOENT for an unlinked socket path
+            // and the daemon wrote three million lines. For a *connected*
+            // datagram socket the only recoverable failures are the two
+            // congestion codes above (EINTR is retried before we get here), so
+            // treat the rest as terminal by default rather than by enumeration.
+            //
+            // Log once, then stop this conn's delivery thread: a client that
+            // exited must not cost every other source a failed syscall and a
+            // log line per frame for the life of the daemon.
+            atomic_fetch_add_explicit(&self->stat_egress_errors, 1, memory_order_relaxed);
+            if (!atomic_exchange_explicit(&self->peer_gone, true, memory_order_acq_rel)) {
+              ERRORN("send(dgram tx): peer is gone, retiring this target");
+              atomic_store(&self->delivery_should_stop, true);
+            }
+          }
+        } else if ((size_t)written != len) {
+          // Should be impossible for SOCK_DGRAM -- a datagram is sent whole or
+          // not at all. Counted rather than assumed away.
+          atomic_fetch_add_explicit(&self->stat_egress_short, 1, memory_order_relaxed);
+        }
+        off += 4 + len;
+      }
+      break;
+    }
+
     // Stream: plain blocking write of the whole snapshot. No send timeout,
     // no retry budget, no "this peer is too slow, disconnect it" heuristic:
     // congestion is already signalled by the ring itself -- a target that
@@ -755,8 +984,9 @@ static bool deliver_from_outbox(struct conn *self, struct outbox *src_outbox, ui
 
 // This conn as a TARGET: pulls from every other known conn's outbox (plus
 // the synthetic vmnet_outbox) and delivers to this conn's own socket. Runs
-// for the conn's whole lifetime, until the connection closes and
-// delivery_should_stop is set.
+// for the conn's whole lifetime (stream: until the connection closes and
+// delivery_should_stop is set; dgram: for the daemon's whole lifetime, same
+// as dgram peers already never being removed from the conns list).
 static void *conn_delivery_thread(void *arg) {
   struct conn *self = arg;
   struct state *state = self->state;
@@ -1200,6 +1430,81 @@ err:
   return -1;
 }
 
+// Binds (but does not listen/accept on) a SOCK_DGRAM unix socket at
+// socket_path. Every datagram received on the returned fd is one raw
+// ethernet frame, with the sender's own address available via recvfrom(2) --
+// this is the framing VZFileHandleNetworkDeviceAttachment-based clients
+// (vfkit, Tart) use.
+// sockbuf_size is the same --sockbuf-size that accepted stream conns get. It
+// matters far more here than it does there: net.local.dgram.recvspace defaults
+// to 4096 bytes on Darwin, under three ethernet frames, and a datagram that
+// does not fit is not queued behind the others -- the sender gets ENOBUFS and
+// the frame is gone. Leaving the default in place throttled a VM<->VM transfer
+// over this socket to 3.2 Mbit/s (against 4.46 Gbit/s on the stream path) with
+// the sender pacing at ~295 packets/s, which is what a send-side ENOBUFS
+// backoff against a two-frame buffer looks like.
+static int socket_binddgram(const char *socket_path, const char *socket_group, int sockbuf_size) {
+  int fd = -1;
+  struct sockaddr_un addr = {0};
+
+  unlink(socket_path); /* avoid EADDRINUSE */
+  if ((fd = socket(PF_LOCAL, SOCK_DGRAM, 0)) < 0) {
+    ERRORN("socket");
+    goto err;
+  }
+  addr.sun_family = PF_LOCAL;
+  size_t socket_len = strlen(socket_path);
+  if (socket_len + 1 > sizeof(addr.sun_path)) {
+    ERRORF("the socket path is too long: %zu", socket_len);
+    goto err;
+  }
+  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    ERRORN("bind");
+    goto err;
+  }
+  // Required by the drain-to-EAGAIN loop in on_dgram_readable().
+  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+    ERRORN("fcntl(O_NONBLOCK)");
+    goto err;
+  }
+  if (sockbuf_size > 0) {
+    // Not fatal: the daemon still works with whatever the kernel grants, just
+    // slowly. kern.ipc.maxsockbuf (8 MiB by default) is the ceiling.
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sockbuf_size, sizeof(sockbuf_size)) < 0) {
+      ERRORN("setsockopt(SO_RCVBUF)");
+    }
+    // The daemon also sendto()s every delivered frame from this same fd.
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sockbuf_size, sizeof(sockbuf_size)) < 0) {
+      ERRORN("setsockopt(SO_SNDBUF)");
+    }
+  }
+  if (socket_group != NULL) {
+    errno = 0;
+    struct group *grp = getgrnam(socket_group); /* Do not free */
+    if (grp == NULL) {
+      if (errno != 0)
+        ERRORN("getgrnam");
+      else
+        ERRORF("unknown group name \"%s\"", socket_group);
+      goto err;
+    }
+    if (chown(socket_path, -1, grp->gr_gid) < 0) {
+      ERRORN("chown");
+      goto err;
+    }
+    if (chmod(socket_path, 0770) < 0) {
+      ERRORN("chmod");
+      goto err;
+    }
+  }
+  return fd;
+err:
+  if (fd >= 0)
+    close(fd);
+  return -1;
+}
+
 static void remove_pidfile(const char *pidfile) {
   if (unlink(pidfile) != 0) {
     ERRORF("Failed to remove pidfile: \"%s\": %s", pidfile, strerror(errno));
@@ -1267,6 +1572,21 @@ static int setup_signals(int kq) {
   return 0;
 }
 
+// EV_CLEAR (edge-triggered) for the dgram socket: its handler drains to EAGAIN
+// on a serial queue, so a level-triggered event would keep re-firing for data
+// already claimed by an in-flight drain, spinning the kqueue loop and queueing
+// blocks with nothing to do.
+static int add_dgram_fd(int kq, int fd) {
+  struct kevent changes[] = {
+      {.ident = fd, .filter = EVFILT_READ, .flags = EV_ADD | EV_CLEAR},
+  };
+  if (kevent(kq, changes, ARRAY_SIZE(changes), NULL, 0, NULL) != 0) {
+    ERRORN("kevent");
+    return -1;
+  }
+  return 0;
+}
+
 static int add_listen_fd(int kq, int fd) {
   struct kevent changes[] = {
       {.ident = fd, .filter = EVFILT_READ, .flags = EV_ADD},
@@ -1290,6 +1610,7 @@ static void dump_metrics(struct state *state) {
   uint64_t pe = atomic_load(&state->stat_park_entries), pw = atomic_load(&state->stat_park_waits);
   uint64_t deliv = 0, bytes = 0, dropped = 0;
   uint64_t pub = 0, pubbytes = 0;
+  uint64_t eagain = 0, enobufs = 0, eerr = 0, eshort = 0;
   int conns = 0;
 
   os_unfair_lock_lock(&state->sem);
@@ -1305,6 +1626,10 @@ static void dump_metrics(struct state *state) {
     dropped += atomic_load(&c->stat_slots_dropped);
     pub += atomic_load(&c->stat_slots_published);
     pubbytes += atomic_load(&c->stat_bytes_published);
+    eagain += atomic_load(&c->stat_egress_eagain);
+    enobufs += atomic_load(&c->stat_egress_enobufs);
+    eerr += atomic_load(&c->stat_egress_errors);
+    eshort += atomic_load(&c->stat_egress_short);
   }
   os_unfair_lock_unlock(&state->sem);
 
@@ -1316,6 +1641,41 @@ static void dump_metrics(struct state *state) {
   INFOF("metrics: published %llu slots / %.1f MB = %.2f KB per slot",
         (unsigned long long)pub, (double)pubbytes / 1e6,
         pub ? (double)pubbytes / (double)pub / 1024.0 : 0.0);
+  if (eagain || enobufs || eerr || eshort) {
+    INFOF("metrics: dgram egress drops: %llu EAGAIN, %llu ENOBUFS, %llu errors, %llu short",
+          (unsigned long long)eagain, (unsigned long long)enobufs, (unsigned long long)eerr,
+          (unsigned long long)eshort);
+  }
+  if (state->dgram_queue != NULL) {
+    uint64_t now = mach_continuous_time();
+    uint64_t busy = atomic_load(&state->stat_dgram_busy_ticks);
+    uint64_t frames = atomic_load(&state->stat_dgram_frames);
+    uint64_t runs = atomic_load(&state->stat_dgram_runs);
+    double busy_us = (double)busy / (double)g_ticks_per_usec;
+    // Share of wall time since the previous dump, which is the number that
+    // matters: one serial thread near 100% is the ceiling, however idle the
+    // rest of the machine looks.
+    double wall_us = state->stat_last_dump_ticks
+                         ? (double)(now - state->stat_last_dump_ticks) / (double)g_ticks_per_usec
+                         : 0.0;
+#ifdef SOCKET_VMNET_DIAG
+    {
+      double rec = (double)atomic_load(&state->stat_dgram_recv_ticks) / (double)g_ticks_per_usec;
+      double vm = (double)atomic_load(&state->stat_dgram_vmnet_ticks) / (double)g_ticks_per_usec;
+      INFOF("metrics: dgram drain split: recvfrom %.1f s, vmnet_write %.1f s, other %.1f s",
+            rec / 1e6, vm / 1e6, (busy_us - rec - vm) / 1e6);
+    }
+#endif
+    INFOF("metrics: dgram drain busy %.1f s total, %llu frames in %llu runs = %.1f frames/run",
+          busy_us / 1e6, (unsigned long long)frames, (unsigned long long)runs,
+          runs ? (double)frames / (double)runs : 0.0);
+    if (wall_us > 0) {
+      INFOF("metrics: dgram drain = %.1f%% of the %.1f s since the last dump",
+            100.0 * (busy_us - state->stat_dgram_busy_us_at_dump) / wall_us, wall_us / 1e6);
+    }
+    state->stat_dgram_busy_us_at_dump = busy_us;
+    state->stat_last_dump_ticks = now;
+  }
   INFOF("metrics: park-entries %llu (%llu waited), broadcasts %llu",
         (unsigned long long)pe, (unsigned long long)pw,
         (unsigned long long)atomic_load(&state->stat_broadcasts));
@@ -1328,11 +1688,13 @@ static void dump_metrics(struct state *state) {
 }
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface);
+static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref iface);
 
 int main(int argc, char *argv[]) {
   debug = getenv("DEBUG") != NULL;
   int rc = 1;
   int listen_fd = -1;
+  int dgram_fd = -1;
   int pidfile_fd = -1;
   int kq = -1;
   __block interface_ref iface = NULL;
@@ -1389,6 +1751,17 @@ int main(int argc, char *argv[]) {
 
   state.sockbuf_size = cliopt->sockbuf_size < 0 ? DEFAULT_SOCKBUF_SIZE : cliopt->sockbuf_size;
 
+  if (cliopt->dgram_socket_path != NULL) {
+    DEBUGF("Opening dgram socket \"%s\" (for UNIX group \"%s\")", cliopt->dgram_socket_path,
+           cliopt->socket_group);
+    dgram_fd = socket_binddgram(cliopt->dgram_socket_path, cliopt->socket_group,
+                                state.sockbuf_size);
+    if (dgram_fd < 0) {
+      ERRORN("socket_binddgram");
+      goto done;
+    }
+  }
+
   state.sem = OS_UNFAIR_LOCK_INIT;
   state.delivery_batch_size = cliopt->delivery_batch_size < 0 ? DEFAULT_DELIVERY_BATCH_SIZE
                                                              : cliopt->delivery_batch_size;
@@ -1409,6 +1782,18 @@ int main(int argc, char *argv[]) {
   state.host_queue =
       dispatch_queue_create("io.github.lima-vm.socket_vmnet.host", DISPATCH_QUEUE_SERIAL);
 
+  // Serial queue and drain buffer for the shared dgram socket, if one is in
+  // use. See struct state for why this must not share the concurrent queue.
+  if (dgram_fd != -1) {
+    state.dgram_queue =
+        dispatch_queue_create("io.github.lima-vm.socket_vmnet.dgram", DISPATCH_QUEUE_SERIAL);
+    state.dgram_scratch = alloc_pages_zeroed(READ_BUF_SIZE);
+    if (state.dgram_scratch == NULL) {
+      ERRORN("mmap(dgram_scratch)");
+      goto done;
+    }
+  }
+
   iface = start(&state, cliopt);
   if (iface == NULL) {
     // Error already logged.
@@ -1418,6 +1803,10 @@ int main(int argc, char *argv[]) {
   if (add_listen_fd(kq, listen_fd)) {
     goto done;
   }
+  if (dgram_fd != -1 && add_dgram_fd(kq, dgram_fd)) {
+    goto done;
+  }
+
   while (1) {
     struct kevent events[1];
     int n = kevent(kq, NULL, 0, events, 1, NULL);
@@ -1461,6 +1850,11 @@ int main(int argc, char *argv[]) {
       dispatch_async(state.vms_queue, ^{
         on_accept(state_p, accept_fd, iface);
       });
+    } else if (events[0].filter == EVFILT_READ && (int)events[0].ident == dgram_fd) {
+      struct state *state_p = &state;
+      dispatch_async(state.dgram_queue, ^{
+        on_dgram_readable(state_p, dgram_fd, iface);
+      });
     }
   }
   rc = 0;
@@ -1487,6 +1881,9 @@ done:
   if (listen_fd != -1) {
     close(listen_fd);
   }
+  if (dgram_fd != -1) {
+    close(dgram_fd);
+  }
   if (pidfile_fd != -1) {
     remove_pidfile(cliopt->pidfile);
     close(pidfile_fd);
@@ -1495,6 +1892,10 @@ done:
     dispatch_release(state.vms_queue);
   if (state.host_queue != NULL)
     dispatch_release(state.host_queue);
+  if (state.dgram_queue != NULL)
+    dispatch_release(state.dgram_queue);
+  if (state.dgram_scratch != NULL)
+    free_pages(state.dgram_scratch, READ_BUF_SIZE);
   if (kq != -1) {
     close(kq);
   }
@@ -1648,4 +2049,120 @@ done:
   state_remove_conn(state, self_conn);
   close(accept_fd);
   conn_release(self_conn);
+}
+
+// Handles one readable event on the shared dgram listening socket: drains
+// exactly one datagram (= one raw ethernet frame, no length header), writes
+// it to vmnet, registers the sender as a peer on first sight, and floods it
+// to every other client (dgram or stream) -- mirroring what on_accept() does
+// for the stream side.
+// Hands one accumulated run of same-peer frames to vmnet and to that peer's
+// outbox: one vmnet_write() and one publish for the whole run, rather than a
+// pair per frame.
+static void dgram_flush_batch(struct state *state, interface_ref iface, struct conn *sender,
+                              uint32_t *headers_be, struct iovec *iov, int count,
+                              uint64_t *vmnet_ticks) {
+  (void)vmnet_ticks; // only read in diagnostic builds
+  if (count <= 0) {
+    return;
+  }
+  atomic_fetch_add_explicit(&state->stat_dgram_runs, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&state->stat_dgram_frames, (uint64_t)count, memory_order_relaxed);
+  struct vmpktdesc pdv[MAX_PACKET_COUNT_AT_ONCE];
+  for (int i = 0; i < count; i++) {
+    pdv[i] = (struct vmpktdesc){.vm_pkt_size = (uint32_t)iov[i].iov_len,
+                                .vm_pkt_iov = &iov[i],
+                                .vm_pkt_iovcnt = 1,
+                                .vm_flags = 0};
+  }
+  int written_count = count;
+  DIAG_TICK_START(t0);
+  vmnet_return_t write_status = VMNET_WRITE_SUPPRESSED(state)
+                                    ? VMNET_SUCCESS
+                                    : vmnet_write(iface, pdv, &written_count);
+  DIAG_TICK_ADD(*vmnet_ticks, t0);
+  if (write_status != VMNET_SUCCESS) {
+    ERRORF("vmnet_write: [%d] %s", write_status, vmnet_strerror(write_status));
+    // Still publish: a vmnet failure concerns the outside world, not the
+    // local peers this frame also belongs to.
+  }
+  // Publish to the sending peer's own outbox instead of writing directly
+  // into every other conn's socket -- same rationale as on_accept() above.
+  if (sender != NULL) {
+    outbox_publish(state, &sender->outbox, headers_be, iov, count);
+  }
+}
+
+// Drains the shared dgram socket to EAGAIN. Runs on state->dgram_queue (serial)
+// and the socket is non-blocking and registered EV_CLEAR, so this is the only
+// reader and it must drain fully -- an edge-triggered event will not fire again
+// for data left behind.
+static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref iface) {
+  uint64_t entered = mach_continuous_time();
+  // Accumulated locally and folded in once at the end: an atomic RMW on every
+  // one of ~466k frames/s would be instrumentation distorting what it measures.
+  uint64_t recv_ticks = 0, vmnet_ticks = 0;
+  (void)recv_ticks;
+  (void)vmnet_ticks;
+  uint8_t *buf = state->dgram_scratch;
+  uint32_t headers_be[MAX_PACKET_COUNT_AT_ONCE];
+  struct iovec iov[MAX_PACKET_COUNT_AT_ONCE];
+  struct conn *sender = NULL;
+  int count = 0;
+  size_t off = 0;
+
+  for (;;) {
+    // Flush before the batch arrays fill, and before the remaining room could
+    // be too small for a maximum-sized datagram. off deliberately keeps
+    // growing across a flush -- the frames just handed to outbox_publish were
+    // copied out of buf, but the one we are about to read must not land on top
+    // of anything still referenced by the current batch.
+    if (count == MAX_PACKET_COUNT_AT_ONCE || READ_BUF_SIZE - off < MAX_FRAME_SIZE) {
+      dgram_flush_batch(state, iface, sender, headers_be, iov, count, &vmnet_ticks);
+      count = 0;
+      sender = NULL;
+      off = 0;
+    }
+
+    struct sockaddr_un peer = {0};
+    socklen_t peer_len = sizeof(peer);
+    DIAG_TICK_START(t2);
+    ssize_t received = recvfrom(dgram_fd, buf + off, READ_BUF_SIZE - off, 0,
+                                (struct sockaddr *)&peer, &peer_len);
+    DIAG_TICK_ADD(recv_ticks, t2);
+    if (received < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break; // drained
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      ERRORN("recvfrom");
+      break;
+    }
+    if (received == 0) {
+      continue;
+    }
+    DEBUGF("[Dgram-to-VMNET] Received from dgram socket: %ld bytes from \"%s\"", received,
+           peer.sun_path);
+
+    struct conn *c = state_find_or_add_dgram_conn(state, dgram_fd, &peer, peer_len);
+    if (count > 0 && c != sender) {
+      // A different VM's frame: close out the run in progress. The frame just
+      // read stays where it is in buf and opens the next one.
+      dgram_flush_batch(state, iface, sender, headers_be, iov, count, &vmnet_ticks);
+      count = 0;
+    }
+    sender = c;
+    headers_be[count] = htonl((uint32_t)received);
+    iov[count] = (struct iovec){.iov_base = buf + off, .iov_len = (size_t)received};
+    count++;
+    off += (size_t)received;
+  }
+
+  dgram_flush_batch(state, iface, sender, headers_be, iov, count, &vmnet_ticks);
+  atomic_fetch_add_explicit(&state->stat_dgram_recv_ticks, recv_ticks, memory_order_relaxed);
+  atomic_fetch_add_explicit(&state->stat_dgram_vmnet_ticks, vmnet_ticks, memory_order_relaxed);
+  atomic_fetch_add_explicit(&state->stat_dgram_busy_ticks, mach_continuous_time() - entered,
+                            memory_order_relaxed);
 }

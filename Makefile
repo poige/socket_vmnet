@@ -24,6 +24,13 @@ VERSION_TRIMMED := $(VERSION:v%=%)
 
 CFLAGS += -DVERSION=\"$(VERSION)\"
 
+# Diagnostics: extra per-section timers on the datagram ingress path and the
+# --skip-vmnet-write switch, which deliberately breaks external connectivity.
+# Off by default; see README.md.
+ifdef DIAG
+CFLAGS += -DSOCKET_VMNET_DIAG
+endif
+
 LDFLAGS ?=
 VMNET_LDFLAGS = -framework vmnet
 

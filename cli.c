@@ -90,6 +90,13 @@ static void print_usage(const char *argv0) {
   printf("                                    Breaks external connectivity; "
          "client-to-client only.\n");
 #endif
+  printf("--dgram-socket=PATH                 also listen on PATH for raw "
+         "SOCK_DGRAM clients\n");
+  printf("                                    (one packet per datagram, no "
+         "length header), e.g.\n");
+  printf("                                    vfkit/Tart. In addition to the "
+         "required SOCKET\n");
+  printf("                                    argument, not instead of it.\n");
   printf("-p, --pidfile=PIDFILE               save pid to PIDFILE\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
@@ -117,6 +124,7 @@ enum {
 #ifdef SOCKET_VMNET_DIAG
   CLI_OPT_SKIP_VMNET_WRITE,
 #endif
+  CLI_OPT_DGRAM_SOCKET,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -146,6 +154,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
 #ifdef SOCKET_VMNET_DIAG
       {"skip-vmnet-write",         no_argument,       NULL, CLI_OPT_SKIP_VMNET_WRITE        },
 #endif
+      {"dgram-socket",             required_argument, NULL, CLI_OPT_DGRAM_SOCKET            },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -225,6 +234,9 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       res->skip_vmnet_write = true;
       break;
 #endif
+    case CLI_OPT_DGRAM_SOCKET:
+      res->dgram_socket_path = strdup(optarg);
+      break;
     case 'p':
       res->pidfile = strdup(optarg);
       break;
@@ -318,6 +330,10 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       goto error;
     }
   }
+  if (res->dgram_socket_path != NULL && strcmp(res->dgram_socket_path, res->socket_path) == 0) {
+    ERROR("--dgram-socket=PATH must differ from the SOCKET argument");
+    goto error;
+  }
   return res;
 error:
   print_usage(argv[0]);
@@ -335,5 +351,6 @@ void cli_options_destroy(struct cli_options *x) {
   free(x->vmnet_mask);
   free(x->vmnet_nat66_prefix);
   free(x->pidfile);
+  free(x->dgram_socket_path);
   free(x);
 }
