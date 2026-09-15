@@ -72,6 +72,24 @@ static void print_usage(const char *argv0) {
   printf("                                    client connection (default: 1 MiB; "
          "0 leaves\n");
   printf("                                    the OS default untouched)\n");
+  printf("--delivery-batch-size=BYTES          max bytes coalesced into one "
+         "write to a\n");
+  printf("                                    client (default: 1 MiB). Separate "
+         "from\n");
+  printf("                                    --sockbuf-size, which sizes the "
+         "kernel buffer.\n");
+  printf("--busy-poll=USEC                     spin this long waiting for new "
+         "data before\n");
+  printf("                                    parking a delivery thread "
+         "(default: 0, off).\n");
+  printf("                                    Analogous to Linux "
+         "net.core.busy_poll.\n");
+#ifdef SOCKET_VMNET_DIAG
+  printf("--skip-vmnet-write                  DIAGNOSTIC: suppress all "
+         "vmnet_write() calls.\n");
+  printf("                                    Breaks external connectivity; "
+         "client-to-client only.\n");
+#endif
   printf("-p, --pidfile=PIDFILE               save pid to PIDFILE\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
@@ -94,6 +112,11 @@ enum {
   CLI_OPT_VMNET_NETWORK_IDENTIFIER,
   CLI_OPT_VMNET_DISABLE_DHCP,
   CLI_OPT_SOCKBUF_SIZE,
+  CLI_OPT_DELIVERY_BATCH_SIZE,
+  CLI_OPT_BUSY_POLL,
+#ifdef SOCKET_VMNET_DIAG
+  CLI_OPT_SKIP_VMNET_WRITE,
+#endif
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -103,6 +126,8 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
   res->sockbuf_size = -1; /* unset; distinguishes "use built-in default" from --sockbuf-size=0 */
+  res->delivery_batch_size = -1; /* unset; use the daemon's built-in default */
+  res->busy_poll_usec = 0; /* off by default */
 
   const struct option longopts[] = {
       {"socket-group",             required_argument, NULL, CLI_OPT_SOCKET_GROUP            },
@@ -116,6 +141,11 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"vmnet-network-identifier", required_argument, NULL, CLI_OPT_VMNET_NETWORK_IDENTIFIER},
       {"vmnet-disable-dhcp",       no_argument,       NULL, CLI_OPT_VMNET_DISABLE_DHCP      },
       {"sockbuf-size",             required_argument, NULL, CLI_OPT_SOCKBUF_SIZE            },
+      {"delivery-batch-size",      required_argument, NULL, CLI_OPT_DELIVERY_BATCH_SIZE     },
+      {"busy-poll",                required_argument, NULL, CLI_OPT_BUSY_POLL               },
+#ifdef SOCKET_VMNET_DIAG
+      {"skip-vmnet-write",         no_argument,       NULL, CLI_OPT_SKIP_VMNET_WRITE        },
+#endif
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -176,6 +206,25 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
         goto error;
       }
       break;
+    case CLI_OPT_DELIVERY_BATCH_SIZE:
+      res->delivery_batch_size = atoi(optarg);
+      if (res->delivery_batch_size <= 0) {
+        ERRORF("invalid value \"%s\" for --delivery-batch-size (must be > 0)", optarg);
+        goto error;
+      }
+      break;
+    case CLI_OPT_BUSY_POLL:
+      res->busy_poll_usec = atoi(optarg);
+      if (res->busy_poll_usec < 0) {
+        ERRORF("invalid value \"%s\" for --busy-poll (must be >= 0)", optarg);
+        goto error;
+      }
+      break;
+#ifdef SOCKET_VMNET_DIAG
+    case CLI_OPT_SKIP_VMNET_WRITE:
+      res->skip_vmnet_write = true;
+      break;
+#endif
     case 'p':
       res->pidfile = strdup(optarg);
       break;

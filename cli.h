@@ -33,6 +33,25 @@ struct cli_options {
   // built-in default"; 0 means "leave the OS default untouched"; a
   // positive value is used as-is.
   int sockbuf_size;
+  // --delivery-batch-size=BYTES; how much a delivery thread may coalesce into
+  // one write() to a target. Distinct from --sockbuf-size, which sizes the
+  // kernel socket buffer: one governs syscall amortization and head-of-line
+  // blocking, the other how much the kernel will hold. They were a single
+  // knob originally, which made both untunable. -1 (default, unset) means
+  // "use the daemon's own built-in default".
+  int delivery_batch_size;
+  // --busy-poll=USEC; how long a delivery thread spins watching for new
+  // published data before parking on the condvar. Named after Linux's
+  // net.core.busy_poll. 0 (the default) parks immediately.
+  int busy_poll_usec;
+  // --skip-vmnet-write; DIAGNOSTIC ONLY. Suppresses every vmnet_write(),
+  // measuring what the XPC round trip into vmnet.framework costs. Breaks all
+  // external connectivity (DHCP, host access, internet) -- only VM<->VM
+  // traffic on one daemon still works, because that is delivered by the local
+  // flood rather than by vmnet. Never for real use.
+#ifdef SOCKET_VMNET_DIAG
+  bool skip_vmnet_write;
+#endif
   // arg
   char *socket_path;
 };
