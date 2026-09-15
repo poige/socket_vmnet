@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/event.h>
+#include <os/lock.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -79,7 +80,7 @@ struct conn {
 } _conn;
 
 struct state {
-  dispatch_semaphore_t sem;
+  os_unfair_lock sem;
   dispatch_queue_t vms_queue;
   dispatch_queue_t host_queue;
   struct conn *conns; // TODO: avoid O(N) lookup
@@ -88,7 +89,7 @@ struct state {
 static void state_add_socket_fd(struct state *state, int socket_fd) {
   struct conn *conn = calloc(1, sizeof(*conn));
   conn->socket_fd = socket_fd;
-  dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+  os_unfair_lock_lock(&state->sem);
   if (state->conns == NULL) {
     state->conns = conn;
   } else {
@@ -97,11 +98,11 @@ static void state_add_socket_fd(struct state *state, int socket_fd) {
       ;
     last->next = conn;
   }
-  dispatch_semaphore_signal(state->sem);
+  os_unfair_lock_unlock(&state->sem);
 }
 
 static void state_remove_socket_fd(struct state *state, int socket_fd) {
-  dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+  os_unfair_lock_lock(&state->sem);
   if (state->conns != NULL) {
     if (state->conns->socket_fd == socket_fd) {
       state->conns = state->conns->next;
@@ -115,7 +116,7 @@ static void state_remove_socket_fd(struct state *state, int socket_fd) {
       }
     }
   }
-  dispatch_semaphore_signal(state->sem);
+  os_unfair_lock_unlock(&state->sem);
 }
 
 static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, int64_t max_bytes,
@@ -163,9 +164,9 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
            "%02X:%02X:%02X:%02X:%02X:%02X,",
            i, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+    os_unfair_lock_lock(&state->sem);
     struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
+    os_unfair_lock_unlock(&state->sem);
     for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
       // FIXME: avoid flooding
       DEBUGF("[Handler i=%d] Sending to the socket %d: 4 + %ld bytes [Dest "
@@ -541,7 +542,7 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
-  state.sem = dispatch_semaphore_create(1);
+  state.sem = OS_UNFAIR_LOCK_INIT;
 
   // Queue for vm connections, allowing processing vms requests in parallel.
   state.vms_queue =
@@ -669,9 +670,9 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     // Flood the packet to other VMs in the same network too.
     // (Not handled by vmnet)
     // FIXME: avoid flooding
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+    os_unfair_lock_lock(&state->sem);
     struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
+    os_unfair_lock_unlock(&state->sem);
     for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
       if (conn->socket_fd == accept_fd)
         continue;
